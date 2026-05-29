@@ -1,14 +1,18 @@
-from tcp_by_size import send_with_size, recv_by_size
+from tcp_by_size import TcpBySize
 import socket
 import sys
 import math
 import pygame
+from encryption import (
+    generate_aes_key, rsa_encrypt,
+    dh_generate_private, dh_compute_public, dh_compute_shared, dh_derive_aes_key
+)
 
 # ====================== CONSTANTS ======================
 WINDOW_WIDTH = 800
 WINDOW_HEIGHT = 600
 
-MAP_RADIUS = 650
+MAP_RADIUS = 1000
 MAP_CENTER_X = MAP_RADIUS
 MAP_CENTER_Y = MAP_RADIUS
 MAP_WIDTH = MAP_RADIUS * 2
@@ -28,7 +32,7 @@ PUDDLE_RADIUS = 90
 
 pygame.init()
 screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-pygame.display.set_caption("Paper.io Multiplayer")
+pygame.display.set_caption("Secure Paper.io Multiplayer")
 clock = pygame.time.Clock()
 
 font = pygame.font.Font(None, 74)
@@ -46,31 +50,84 @@ def create_local_puddle(color, start_x, start_y):
     return surf
 
 
-def draw_local_capture(surf, points, color):
+def apply_local_capture(p_id, points, color, surfaces_dict):
     if len(points) < 2: return
+
+    xs = [pt[0] for pt in points]
+    ys = [pt[1] for pt in points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    margin = int(TRAIL_WIDTH + 15)
+    bx1 = max(0, int(min_x - margin))
+    by1 = max(0, int(min_y - margin))
+    bx2 = min(MAP_WIDTH, int(max_x + margin))
+    by2 = min(MAP_HEIGHT, int(max_y + margin))
+    bw = bx2 - bx1
+    bh = by2 - by1
+
+    if bw <= 0 or bh <= 0: return
+
+    surf = surfaces_dict[p_id]
     p_color = (max(0, color[0] - 40), max(0, color[1] - 40), max(0, color[2] - 40), 255)
 
-    temp_surf = pygame.Surface((MAP_WIDTH, MAP_HEIGHT), pygame.SRCALPHA)
+    sub_surf = pygame.Surface((bw, bh), pygame.SRCALPHA)
+    sub_surf.blit(surf, (0, 0), pygame.Rect(bx1, by1, bw, bh))
+
     for i in range(len(points) - 1):
-        pygame.draw.line(temp_surf, p_color, points[i], points[i + 1], TRAIL_WIDTH + 2)
-        pygame.draw.circle(temp_surf, p_color, points[i], (TRAIL_WIDTH // 2) + 1)
-    pygame.draw.circle(temp_surf, p_color, points[-1], (TRAIL_WIDTH // 2) + 1)
-    surf.blit(temp_surf, (0, 0))
+        p1 = (points[i][0] - bx1, points[i][1] - by1)
+        p2 = (points[i + 1][0] - bx1, points[i + 1][1] - by1)
+        pygame.draw.line(sub_surf, p_color, p1, p2, TRAIL_WIDTH + 2)
+        pygame.draw.circle(sub_surf, p_color, p1, (TRAIL_WIDTH // 2) + 1)
+    p_last = (points[-1][0] - bx1, points[-1][1] - by1)
+    pygame.draw.circle(sub_surf, p_color, p_last, (TRAIL_WIDTH // 2) + 1)
 
-    solid_mask = pygame.mask.from_surface(surf)
-    empty_mask = solid_mask.copy()
-    empty_mask.invert()
+    sub_mask = pygame.mask.from_surface(sub_surf)
+    sub_empty_mask = pygame.mask.Mask((bw, bh), fill=True)
+    sub_empty_mask.erase(sub_mask, (0, 0))
 
-    edge_mask = pygame.mask.Mask((MAP_WIDTH, MAP_HEIGHT))
-    edge_mask.fill()
-    inner_mask = pygame.mask.Mask((MAP_WIDTH - 2, MAP_HEIGHT - 2))
-    inner_mask.fill()
-    edge_mask.erase(inner_mask, (1, 1))
+    reached_outside = pygame.mask.Mask((bw, bh), fill=False)
+    border_pts = []
+    for x in range(bw):
+        border_pts.append((x, 0))
+        border_pts.append((x, bh - 1))
+    for y in range(1, bh - 1):
+        border_pts.append((0, y))
+        border_pts.append((bw - 1, y))
 
-    for comp in empty_mask.connected_components():
-        if not comp.overlap(edge_mask, (0, 0)):
-            enclosed_surf = comp.to_surface(setcolor=p_color, unsetcolor=(0, 0, 0, 0))
-            surf.blit(enclosed_surf, (0, 0))
+    for pt in border_pts:
+        if sub_empty_mask.get_at(pt) and not reached_outside.get_at(pt):
+            comp = sub_empty_mask.connected_component(pt)
+            reached_outside.draw(comp, (0, 0))
+
+    holes_mask = sub_empty_mask.copy()
+    holes_mask.erase(reached_outside, (0, 0))
+
+    holes_surf = holes_mask.to_surface(setcolor=p_color, unsetcolor=(0, 0, 0, 0))
+    surf.blit(holes_surf, (bx1, by1))
+
+    for i in range(len(points) - 1):
+        pygame.draw.line(surf, p_color, points[i], points[i + 1], TRAIL_WIDTH + 2)
+        pygame.draw.circle(surf, p_color, points[i], (TRAIL_WIDTH // 2) + 1)
+    pygame.draw.circle(surf, p_color, points[-1], (TRAIL_WIDTH // 2) + 1)
+
+    trail_only_surf = pygame.Surface((bw, bh), pygame.SRCALPHA)
+    for i in range(len(points) - 1):
+        p1 = (points[i][0] - bx1, points[i][1] - by1)
+        p2 = (points[i + 1][0] - bx1, points[i + 1][1] - by1)
+        pygame.draw.line(trail_only_surf, (255, 255, 255, 255), p1, p2, TRAIL_WIDTH + 2)
+        pygame.draw.circle(trail_only_surf, (255, 255, 255, 255), p1, (TRAIL_WIDTH // 2) + 1)
+    pygame.draw.circle(trail_only_surf, (255, 255, 255, 255), p_last, (TRAIL_WIDTH // 2) + 1)
+
+    trail_only_mask = pygame.mask.from_surface(trail_only_surf)
+    stolen_sub_mask = holes_mask.copy()
+    stolen_sub_mask.draw(trail_only_mask, (0, 0))
+
+    erase_surf = stolen_sub_mask.to_surface(setcolor=(255, 255, 255, 255), unsetcolor=(0, 0, 0, 0))
+
+    for other_id, other_surf in surfaces_dict.items():
+        if other_id != p_id:
+            other_surf.blit(erase_surf, (bx1, by1), special_flags=pygame.BLEND_RGBA_SUB)
 
 
 map_background = pygame.Surface((MAP_WIDTH, MAP_HEIGHT))
@@ -82,11 +139,10 @@ my_color = (0, 0, 255)
 game_state = "LOBBY"
 
 
-def sync_world_data(byte_reply):
+def sync_world_data(str_reply):
     global game_state
     try:
-        data_str = byte_reply.decode('utf8')
-        sections = data_str.split('~')
+        sections = str_reply.split('~')
         if sections[0] != 'WRLDR': return []
 
         players_list = []
@@ -116,7 +172,6 @@ def sync_world_data(byte_reply):
                 players_list.append(
                     {'id': uid, 'x': px, 'y': py, 'alive': alive, 'color': (r, g, b), 'trail': trail_pts})
 
-                # Check personal vitals -> trigger DEATH state
                 if uid == my_id and not alive:
                     game_state = "DEAD"
             else:
@@ -132,7 +187,7 @@ def sync_world_data(byte_reply):
 
                 if cid in puddle_surfaces:
                     target_color = next((p['color'] for p in players_list if p['id'] == cid), (0, 0, 255))
-                    draw_local_capture(puddle_surfaces[cid], cap_pts, target_color)
+                    apply_local_capture(cid, cap_pts, target_color, puddle_surfaces)
 
         return players_list
     except Exception as e:
@@ -140,30 +195,88 @@ def sync_world_data(byte_reply):
         return []
 
 
+# ====================== ENCRYPTION HANDSHAKE ======================
+def connect_securely(ip, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.connect((ip, port))
+        conn = TcpBySize(sock)
+
+        # We will hardcode to DH for the game, just to ensure high security
+        method = "DH"
+
+        conn.send(f"METHOD|{method}")
+        resp = conn.recv()
+
+        if resp.startswith("METHOD_FAIL"):
+            print("Server rejected method.")
+            return None
+
+        if method == "RSA":
+            conn.send("PUBKEY_REQ")
+            resp = conn.recv()
+            if not resp.startswith("PUBKEY|"): return None
+            pub_pem = bytes.fromhex(resp.split("|", 1)[1])
+
+            aes_key = generate_aes_key()
+            encrypted = rsa_encrypt(aes_key, pub_pem)
+            conn.send("KEY|" + encrypted.hex())
+
+            ack = conn.recv()
+            if ack != "KEY_OK": return None
+            conn.key = aes_key
+
+        elif method == "DH":
+            resp = conn.recv()
+            if not resp.startswith("DH_PARAMS|"): return None
+            parts = resp.split("|")
+            p = int(parts[1], 16)
+            g = int(parts[2])
+            server_public = int(parts[3], 16)
+
+            my_private = dh_generate_private()
+            my_public = dh_compute_public(my_private)
+            conn.send(f"DH_KEY|{my_public:x}")
+
+            shared = dh_compute_shared(server_public, my_private)
+            aes_key = dh_derive_aes_key(shared)
+
+            ack = conn.recv()
+            if ack != "KEY_OK": return None
+            conn.key = aes_key
+
+        return sock, conn
+    except Exception as e:
+        print(f"Connection failed: {e}")
+        return None
+
+
 def main(server_ip):
     global game_state, my_id, my_color, puddle_surfaces
 
-    sock = socket.socket()
-    try:
-        sock.connect((server_ip, 1233))
-    except Exception as e:
-        print(f"Failed connecting to server {server_ip}: {e}")
+    print("Establishing secure connection to server...")
+    connection_data = connect_securely(server_ip, 1233)
+
+    if not connection_data:
+        print("Failed to establish secure connection. Exiting.")
         return
+
+    sock, conn = connection_data
+    print("Connection encrypted successfully.")
 
     running = True
     active_players = []
 
     while running:
-        # 1. EVENT LAYER
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                if my_id: send_with_size(sock, f"EXIT~{my_id}".encode())
+                if my_id: conn.send(f"EXIT~{my_id}")
                 running = False
 
             if game_state == "LOBBY" and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if start_button_rect.collidepoint(event.pos):
-                    send_with_size(sock, b"JOIN")
-                    reply = recv_by_size(sock).decode('utf8').split('~')
+                    conn.send("JOIN")
+                    reply = conn.recv().split('~')
                     if reply[0] == 'JOINR':
                         my_id = reply[1]
                         c_parts = reply[2].split(',')
@@ -173,10 +286,9 @@ def main(server_ip):
                     else:
                         print("Could not join:", reply)
 
-        # 2. LOGIC & COMM LAYER
         if game_state == "LOBBY":
             screen.fill(BLACK)
-            title_text = font.render("PUDDLE WORLD MP", True, WHITE)
+            title_text = font.render("Paper.Tom", True, WHITE)
             screen.blit(title_text, (WINDOW_WIDTH // 2 - title_text.get_width() // 2, WINDOW_HEIGHT // 4))
 
             button_color = TRAIL_ALPHA_COLOR if start_button_rect.collidepoint(
@@ -188,11 +300,9 @@ def main(server_ip):
                                    start_button_rect.centery - btn_text.get_height() // 2))
 
         elif game_state == "WAITING":
-            send_with_size(sock, f"UPDT~{my_id}~0~0".encode())
-            reply_bytes = recv_by_size(sock)
-            if not reply_bytes: break
-
-            reply_str = reply_bytes.decode('utf8')
+            conn.send(f"UPDT~{my_id}~0~0")
+            reply_str = conn.recv()
+            if not reply_str: break
 
             if reply_str.startswith("WAIT"):
                 parts = reply_str.split('~')
@@ -205,7 +315,7 @@ def main(server_ip):
 
             elif reply_str.startswith("WRLDR"):
                 game_state = "GAME"
-                active_players = sync_world_data(reply_bytes)
+                active_players = sync_world_data(reply_str)
 
                 for p in active_players:
                     if p['id'] not in puddle_surfaces:
@@ -230,44 +340,57 @@ def main(server_ip):
             else:
                 dx, dy = 0, 0
 
-            send_with_size(sock, f"UPDT~{my_id}~{dx}~{dy}".encode())
-            reply_bytes = recv_by_size(sock)
-            active_players = sync_world_data(reply_bytes)
+            conn.send(f"UPDT~{my_id}~{dx}~{dy}")
+            reply_str = conn.recv()
+            active_players = sync_world_data(reply_str)
 
-            # --- EXIT ON DEATH ---
-            # If the sync function registered that we died, clear data and leave to lobby
+            active_ids = {p['id'] for p in active_players if p['alive']}
+            keys_to_remove = [pid for pid in puddle_surfaces if pid not in active_ids]
+            for k in keys_to_remove:
+                del puddle_surfaces[k]
+
             if game_state == "DEAD":
-                send_with_size(sock, f"EXIT~{my_id}".encode())
+                conn.send(f"EXIT~{my_id}")
+                conn.recv()
                 my_id = None
                 puddle_surfaces.clear()
                 active_players = []
                 game_state = "LOBBY"
-                continue  # Skip drawing this frame and go straight to lobby
+                continue
 
             for p in active_players:
-                if p['id'] not in puddle_surfaces:
+                if p['id'] not in puddle_surfaces and p['alive']:
                     px = p['x'] + PLAYER_WIDTH // 2
                     py = p['y'] + PLAYER_HEIGHT // 2
                     puddle_surfaces[p['id']] = create_local_puddle(p['color'], px, py)
 
-            # 3. DRAWING LAYER
             screen.fill(BLACK)
             screen.blit(map_background, (-cam_x, -cam_y))
-
-            for p in active_players:
-                if not p['alive'] or len(p['trail']) < 2: continue
-                t_color = (p['color'][0], p['color'][1], p['color'][2], 180)
-                for i in range(len(p['trail']) - 1):
-                    start = (p['trail'][i][0] - cam_x, p['trail'][i][1] - cam_y)
-                    end = (p['trail'][i + 1][0] - cam_x, p['trail'][i + 1][1] - cam_y)
-                    pygame.draw.line(screen, t_color, start, end, TRAIL_WIDTH)
-                    pygame.draw.circle(screen, t_color, start, TRAIL_WIDTH // 2)
-                pygame.draw.circle(screen, t_color, (p['trail'][-1][0] - cam_x, p['trail'][-1][1] - cam_y),
-                                   TRAIL_WIDTH // 2)
 
             for p_id, p_surf in puddle_surfaces.items():
                 if any(p['id'] == p_id for p in active_players):
                     screen.blit(p_surf, (-cam_x, -cam_y))
+
+            for p in active_players:
+                if not p['alive'] or len(p['trail']) < 2: continue
+                t_color = (p['color'][0], p['color'][1], p['color'][2], 180)
+
+                trail_surf = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+
+                for i in range(len(p['trail']) - 1):
+                    start = (p['trail'][i][0] - cam_x, p['trail'][i][1] - cam_y)
+                    end = (p['trail'][i + 1][0] - cam_x, p['trail'][i + 1][1] - cam_y)
+                    pygame.draw.line(trail_surf, t_color, start, end, TRAIL_WIDTH)
+                    pygame.draw.circle(trail_surf, t_color, start, TRAIL_WIDTH // 2)
+                pygame.draw.circle(trail_surf, t_color, (p['trail'][-1][0] - cam_x, p['trail'][-1][1] - cam_y),
+                                   TRAIL_WIDTH // 2)
+
+                if p['id'] in puddle_surfaces:
+                    erase_surf = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+                    erase_surf.blit(puddle_surfaces[p['id']], (-cam_x, -cam_y))
+                    trail_surf.blit(erase_surf, (0, 0), special_flags=pygame.BLEND_RGBA_SUB)
+
+                screen.blit(trail_surf, (0, 0))
 
             for p in active_players:
                 if not p['alive']: continue

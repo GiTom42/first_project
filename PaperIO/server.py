@@ -1,15 +1,19 @@
-from tcp_by_size import send_with_size, recv_by_size
+from tcp_by_size import TcpBySize
 import socket
 import threading
 import math
-import traceback
 import pygame
 import random
+from encryption import (
+    generate_rsa_keys, rsa_decrypt,
+    dh_generate_private, dh_compute_public, dh_compute_shared,
+    dh_derive_aes_key, DH_PRIME, DH_GENERATOR
+)
 
 pygame.init()
 
 # ====================== CONSTANTS ======================
-MAP_RADIUS = 650
+MAP_RADIUS = 1000
 MAP_CENTER_X = MAP_RADIUS
 MAP_CENTER_Y = MAP_RADIUS
 MAP_WIDTH = MAP_RADIUS * 2
@@ -17,17 +21,16 @@ MAP_HEIGHT = MAP_RADIUS * 2
 
 PLAYER_WIDTH = 35
 PLAYER_HEIGHT = 35
-PLAYER_SPEED = 3
+PLAYER_SPEED = 4
 TRAIL_WIDTH = PLAYER_WIDTH
 PUDDLE_RADIUS = 90
 
 REQUIRED_PLAYERS = 2
 
-edge_mask = pygame.mask.Mask((MAP_WIDTH, MAP_HEIGHT))
-edge_mask.fill()
-inner_mask = pygame.mask.Mask((MAP_WIDTH - 2, MAP_HEIGHT - 2))
-inner_mask.fill()
-edge_mask.erase(inner_mask, (1, 1))
+# Generate Server RSA Keys once on startup
+print("Generating Server RSA Keys...")
+RSA_PRIVATE_PEM, RSA_PUBLIC_PEM = generate_rsa_keys()
+print("Keys Generated.")
 
 
 # ====================== GAME STATE MANAGER ======================
@@ -42,6 +45,7 @@ class PlayerSession:
         self.color = (random.randint(20, 230), random.randint(20, 230), random.randint(20, 230))
         self.last_inside_pos = (0, 0)
         self.puddle_surface = pygame.Surface((MAP_WIDTH, MAP_HEIGHT), pygame.SRCALPHA)
+        self.unread_captures = []
 
     def set_spawn(self, cx, cy):
         self.x = cx - PLAYER_WIDTH / 2.0
@@ -57,8 +61,6 @@ class GameState:
         self.players = {}
         self.lock = threading.Lock()
         self.next_id = 1
-        self.pending_captures = []
-
         self.phase = "WAITING"
         self.required_players = REQUIRED_PLAYERS
 
@@ -66,6 +68,10 @@ class GameState:
         with self.lock:
             if self.phase == "PLAYING":
                 return None
+
+            if self.phase == "GAMEOVER":
+                self.players.clear()
+                self.phase = "WAITING"
 
             p_id = str(self.next_id)
             self.players[p_id] = PlayerSession(p_id)
@@ -81,14 +87,6 @@ class GameState:
             if p_id in self.players:
                 del self.players[p_id]
 
-            # If someone disconnects mid-game leaving only 1 person, end the game
-            if self.phase == "PLAYING":
-                alive_count = sum(1 for p in self.players.values() if p.alive)
-                if alive_count <= 1:
-                    for p in self.players.values():
-                        p.alive = False
-
-            # Reset the room completely when everyone has exited
             if len(self.players) == 0:
                 self.phase = "WAITING"
 
@@ -141,43 +139,88 @@ class GameState:
             if is_inside and not p.was_inside_puddle:
                 p.trail_points.append(p_center)
                 if len(p.trail_points) >= 2:
-                    temp_surf = pygame.Surface((MAP_WIDTH, MAP_HEIGHT), pygame.SRCALPHA)
-                    for i in range(len(p.trail_points) - 1):
-                        pygame.draw.line(temp_surf, (255, 255, 255, 255), p.trail_points[i], p.trail_points[i + 1],
-                                         TRAIL_WIDTH + 2)
-                        pygame.draw.circle(temp_surf, (255, 255, 255, 255), p.trail_points[i], (TRAIL_WIDTH // 2) + 1)
-                    pygame.draw.circle(temp_surf, (255, 255, 255, 255), p.trail_points[-1], (TRAIL_WIDTH // 2) + 1)
-                    p.puddle_surface.blit(temp_surf, (0, 0))
+                    xs = [pt[0] for pt in p.trail_points]
+                    ys = [pt[1] for pt in p.trail_points]
+                    min_x, max_x = min(xs), max(xs)
+                    min_y, max_y = min(ys), max(ys)
 
-                    solid_mask = pygame.mask.from_surface(p.puddle_surface)
-                    empty_mask = solid_mask.copy()
-                    empty_mask.invert()
+                    margin = int(TRAIL_WIDTH + 15)
+                    bx1 = max(0, int(min_x - margin))
+                    by1 = max(0, int(min_y - margin))
+                    bx2 = min(MAP_WIDTH, int(max_x + margin))
+                    by2 = min(MAP_HEIGHT, int(max_y + margin))
+                    bw = bx2 - bx1
+                    bh = by2 - by1
 
-                    components = empty_mask.connected_components()
-                    enclosed_mask = pygame.mask.Mask((MAP_WIDTH, MAP_HEIGHT))
+                    if bw > 0 and bh > 0:
+                        sub_surf = pygame.Surface((bw, bh), pygame.SRCALPHA)
+                        sub_surf.blit(p.puddle_surface, (0, 0), pygame.Rect(bx1, by1, bw, bh))
 
-                    for comp in components:
-                        if not comp.overlap(edge_mask, (0, 0)):
-                            enclosed_mask.draw(comp, (0, 0))
+                        for i in range(len(p.trail_points) - 1):
+                            p1 = (p.trail_points[i][0] - bx1, p.trail_points[i][1] - by1)
+                            p2 = (p.trail_points[i + 1][0] - bx1, p.trail_points[i + 1][1] - by1)
+                            pygame.draw.line(sub_surf, (255, 255, 255, 255), p1, p2, TRAIL_WIDTH + 2)
+                            pygame.draw.circle(sub_surf, (255, 255, 255, 255), p1, (TRAIL_WIDTH // 2) + 1)
+                        p_last = (p.trail_points[-1][0] - bx1, p.trail_points[-1][1] - by1)
+                        pygame.draw.circle(sub_surf, (255, 255, 255, 255), p_last, (TRAIL_WIDTH // 2) + 1)
 
-                    if enclosed_mask.count() > 0:
-                        enclosed_surf = enclosed_mask.to_surface(setcolor=(255, 255, 255, 255), unsetcolor=(0, 0, 0, 0))
-                        p.puddle_surface.blit(enclosed_surf, (0, 0))
+                        sub_mask = pygame.mask.from_surface(sub_surf)
+                        sub_empty_mask = pygame.mask.Mask((bw, bh), fill=True)
+                        sub_empty_mask.erase(sub_mask, (0, 0))
 
-                    self.pending_captures.append((p_id, list(p.trail_points)))
+                        reached_outside = pygame.mask.Mask((bw, bh), fill=False)
+                        border_pts = []
+                        for x in range(bw):
+                            border_pts.append((x, 0))
+                            border_pts.append((x, bh - 1))
+                        for y in range(1, bh - 1):
+                            border_pts.append((0, y))
+                            border_pts.append((bw - 1, y))
+
+                        for pt in border_pts:
+                            if sub_empty_mask.get_at(pt) and not reached_outside.get_at(pt):
+                                comp = sub_empty_mask.connected_component(pt)
+                                reached_outside.draw(comp, (0, 0))
+
+                        holes_mask = sub_empty_mask.copy()
+                        holes_mask.erase(reached_outside, (0, 0))
+
+                        holes_surf = holes_mask.to_surface(setcolor=(255, 255, 255, 255), unsetcolor=(0, 0, 0, 0))
+                        p.puddle_surface.blit(holes_surf, (bx1, by1))
+
+                        for i in range(len(p.trail_points) - 1):
+                            pygame.draw.line(p.puddle_surface, (255, 255, 255, 255), p.trail_points[i],
+                                             p.trail_points[i + 1], TRAIL_WIDTH + 2)
+                            pygame.draw.circle(p.puddle_surface, (255, 255, 255, 255), p.trail_points[i],
+                                               (TRAIL_WIDTH // 2) + 1)
+                        pygame.draw.circle(p.puddle_surface, (255, 255, 255, 255), p.trail_points[-1],
+                                           (TRAIL_WIDTH // 2) + 1)
+
+                        trail_only_surf = pygame.Surface((bw, bh), pygame.SRCALPHA)
+                        for i in range(len(p.trail_points) - 1):
+                            p1 = (p.trail_points[i][0] - bx1, p.trail_points[i][1] - by1)
+                            p2 = (p.trail_points[i + 1][0] - bx1, p.trail_points[i + 1][1] - by1)
+                            pygame.draw.line(trail_only_surf, (255, 255, 255, 255), p1, p2, TRAIL_WIDTH + 2)
+                            pygame.draw.circle(trail_only_surf, (255, 255, 255, 255), p1, (TRAIL_WIDTH // 2) + 1)
+                        pygame.draw.circle(trail_only_surf, (255, 255, 255, 255), p_last, (TRAIL_WIDTH // 2) + 1)
+
+                        trail_only_mask = pygame.mask.from_surface(trail_only_surf)
+                        stolen_sub_mask = holes_mask.copy()
+                        stolen_sub_mask.draw(trail_only_mask, (0, 0))
+
+                        erase_surf = stolen_sub_mask.to_surface(setcolor=(255, 255, 255, 255), unsetcolor=(0, 0, 0, 0))
+
+                        for enemy_id, enemy in self.players.items():
+                            if enemy_id != p_id:
+                                enemy.puddle_surface.blit(erase_surf, (bx1, by1), special_flags=pygame.BLEND_RGBA_SUB)
+
+                        for target_player in self.players.values():
+                            target_player.unread_captures.append((p_id, list(p.trail_points)))
 
                 p.trail_points = []
 
             p.was_inside_puddle = is_inside
             self._check_collisions(p_id, p_center)
-
-            # --- MATCH END LOGIC ---
-            # If 1 or 0 players remain alive, the game is over!
-            if self.phase == "PLAYING":
-                alive_count = sum(1 for p in self.players.values() if p.alive)
-                if alive_count <= 1:
-                    for p_obj in self.players.values():
-                        p_obj.alive = False  # Mark everyone dead to force them to lobby
 
     def _check_collisions(self, current_id, p_center):
         def point_to_segment_dist(p, a, b):
@@ -206,6 +249,7 @@ class GameState:
                 if dist < hitbox_radius + (TRAIL_WIDTH / 2):
                     self.players[current_id].alive = False
                     self.players[current_id].trail_points = []
+                    self.players[current_id].puddle_surface.fill((0, 0, 0, 0))
                     return
 
 
@@ -213,24 +257,23 @@ shared_game = GameState()
 
 
 # ====================== PROTOCOL ROUTER ======================
-def protocol_build_reply(request):
+def protocol_build_reply(req_str):
     try:
-        req_str = request.decode("utf8")
         fields = req_str.split('~')
         code = fields[0]
 
         if code == 'JOIN':
             p_id = shared_game.add_player()
             if not p_id:
-                return b"ERRR~Match already in progress!"
+                return "ERRR~Match already in progress!"
             p = shared_game.players[p_id]
-            return f"JOINR~{p_id}~{p.color[0]},{p.color[1]},{p.color[2]}".encode()
+            return f"JOINR~{p_id}~{p.color[0]},{p.color[1]},{p.color[2]}"
 
         elif code == 'UPDT':
             if shared_game.phase == "WAITING":
                 curr = len(shared_game.players)
                 req = shared_game.required_players
-                return f"WAIT~{curr}~{req}".encode()
+                return f"WAIT~{curr}~{req}"
 
             p_id = fields[1]
             dx, dy = float(fields[2]), float(fields[3])
@@ -246,47 +289,104 @@ def protocol_build_reply(request):
 
             cap_strings = []
             with shared_game.lock:
-                for cid, pts in shared_game.pending_captures:
-                    pts_str = "|".join([f"{int(pt[0])}:{int(pt[1])}" for pt in pts])
-                    cap_strings.append(f"{cid},{pts_str}")
-                shared_game.pending_captures.clear()
+                if p_id in shared_game.players:
+                    for cid, pts in shared_game.players[p_id].unread_captures:
+                        pts_str = "|".join([f"{int(pt[0])}:{int(pt[1])}" for pt in pts])
+                        cap_strings.append(f"{cid},{pts_str}")
+                    shared_game.players[p_id].unread_captures.clear()
 
             reply_str = "WRLDR~" + "~".join(player_strings)
             if cap_strings:
                 reply_str += "~CAPT~" + "~".join(cap_strings)
-            return reply_str.encode()
+            return reply_str
 
         elif code == 'EXIT':
             shared_game.remove_player(fields[1])
-            return b'EXTR'
+            return 'EXTR'
 
     except Exception as e:
         print(f"Protocol packing error: {e}")
 
-    return b'ERRR~001~Internal Error'
+    return 'ERRR~001~Internal Error'
+
+
+# ====================== ENCRYPTION HANDSHAKE ======================
+def do_key_exchange(conn):
+    method_msg = conn.recv()
+    if not method_msg.startswith("METHOD|"):
+        return False
+
+    method = method_msg.split("|", 1)[1].upper()
+
+    if method not in ("RSA", "DH"):
+        conn.send("METHOD_FAIL|Unsupported method")
+        return False
+
+    conn.send("METHOD_OK")
+
+    if method == "RSA":
+        req = conn.recv()
+        if req != "PUBKEY_REQ":
+            return False
+
+        conn.send("PUBKEY|" + RSA_PUBLIC_PEM.hex())
+
+        key_msg = conn.recv()
+        if not key_msg.startswith("KEY|"):
+            return False
+
+        encrypted_aes = bytes.fromhex(key_msg.split("|", 1)[1])
+        aes_key = rsa_decrypt(encrypted_aes, RSA_PRIVATE_PEM)
+        conn.send("KEY_OK")
+        conn.key = aes_key
+        return True
+    else:
+        server_private = dh_generate_private()
+        server_public = dh_compute_public(server_private)
+
+        conn.send(f"DH_PARAMS|{DH_PRIME:x}|{DH_GENERATOR}|{server_public:x}")
+
+        resp = conn.recv()
+        if not resp.startswith("DH_KEY|"):
+            return False
+
+        client_public = int(resp.split("|", 1)[1], 16)
+        shared = dh_compute_shared(client_public, server_private)
+        aes_key = dh_derive_aes_key(shared)
+        conn.send("KEY_OK")
+        conn.key = aes_key
+        return True
 
 
 def handle_client(sock, tid, addr):
     p_id = None
     try:
-        while True:
-            byte_data = recv_by_size(sock)
-            if byte_data == b'': break  # Only break if the connection drops
+        conn = TcpBySize(sock)
 
-            if byte_data.startswith(b'UPDT') or byte_data.startswith(b'EXIT'):
-                parts = byte_data.decode('utf8').split('~')
+        # Require secure handshake before processing any game requests
+        if not do_key_exchange(conn):
+            print(f"Key exchange failed for {addr}")
+            sock.close()
+            return
+
+        print(f"Secure connection established with {addr}")
+
+        while True:
+            # TcpBySize handles the decryption automatically
+            str_data = conn.recv()
+            if not str_data: break
+
+            if str_data.startswith('UPDT') or str_data.startswith('EXIT'):
+                parts = str_data.split('~')
                 if len(parts) > 1: p_id = parts[1]
 
-            to_send = protocol_build_reply(byte_data)
-            send_with_size(sock, to_send)
-
-            # REMOVED the line: if byte_data.startswith(b'EXIT'): break
-            # The server will now keep listening for the next JOIN command!
+            to_send = protocol_build_reply(str_data)
+            # TcpBySize handles the encryption automatically
+            conn.send(to_send)
 
     except Exception as e:
         pass
     finally:
-        # This will perfectly clean up their data if they close the game window completely
         if p_id: shared_game.remove_player(p_id)
         sock.close()
 
@@ -297,7 +397,7 @@ def main():
     srv_sock.listen(20)
     srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     i = 1
-    print(f"Multiplayer Server running. Waiting for {REQUIRED_PLAYERS} players to start a match...")
+    print(f"Multiplayer Secure Server running. Waiting for {REQUIRED_PLAYERS} players...")
     while True:
         cli_sock, addr = srv_sock.accept()
         t = threading.Thread(target=handle_client, args=(cli_sock, str(i), addr))
