@@ -25,7 +25,7 @@ PLAYER_SPEED = 4
 TRAIL_WIDTH = PLAYER_WIDTH
 PUDDLE_RADIUS = 90
 
-REQUIRED_PLAYERS = 2
+REQUIRED_PLAYERS = 1
 
 # Generate Server RSA Keys once on startup
 print("Generating Server RSA Keys...")

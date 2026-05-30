@@ -27,6 +27,8 @@ WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 TRAIL_ALPHA_COLOR = (100, 149, 237)
 PUDDLE_BASE_COLOR = (0, 80, 170)
+GOLD = (255, 215, 0)  # Used for the percentage text
+
 TRAIL_WIDTH = PLAYER_WIDTH
 PUDDLE_RADIUS = 90
 
@@ -55,20 +57,22 @@ def apply_local_capture(p_id, points, color, surfaces_dict):
 
     xs = [pt[0] for pt in points]
     ys = [pt[1] for pt in points]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
+
+    # Use union to ensure the bounding box doesn't cut off "valleys" in the base shape
+    surf = surfaces_dict[p_id]
+    trail_rect = pygame.Rect(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+    base_rect = surf.get_bounding_rect()
+    capture_rect = base_rect.union(trail_rect)
 
     margin = int(TRAIL_WIDTH + 15)
-    bx1 = max(0, int(min_x - margin))
-    by1 = max(0, int(min_y - margin))
-    bx2 = min(MAP_WIDTH, int(max_x + margin))
-    by2 = min(MAP_HEIGHT, int(max_y + margin))
-    bw = bx2 - bx1
-    bh = by2 - by1
+    capture_rect.inflate_ip(margin * 2, margin * 2)
+    capture_rect = capture_rect.clip(pygame.Rect(0, 0, MAP_WIDTH, MAP_HEIGHT))
+
+    bx1, by1 = capture_rect.x, capture_rect.y
+    bw, bh = capture_rect.width, capture_rect.height
 
     if bw <= 0 or bh <= 0: return
 
-    surf = surfaces_dict[p_id]
     p_color = (max(0, color[0] - 40), max(0, color[1] - 40), max(0, color[2] - 40), 255)
 
     sub_surf = pygame.Surface((bw, bh), pygame.SRCALPHA)
@@ -172,7 +176,7 @@ def sync_world_data(str_reply):
                 players_list.append(
                     {'id': uid, 'x': px, 'y': py, 'alive': alive, 'color': (r, g, b), 'trail': trail_pts})
 
-                if uid == my_id and not alive:
+                if uid == my_id and not alive and game_state == "GAME":
                     game_state = "DEAD"
             else:
                 parts = section.split(',')
@@ -202,7 +206,6 @@ def connect_securely(ip, port):
         sock.connect((ip, port))
         conn = TcpBySize(sock)
 
-        # We will hardcode to DH for the game, just to ensure high security
         method = "DH"
 
         conn.send(f"METHOD|{method}")
@@ -267,6 +270,13 @@ def main(server_ip):
     running = True
     active_players = []
 
+    # --- MATCH TRACKING VARIABLES ---
+    end_screen_start_time = 0
+    current_percentage = 0.0
+    frame_counter = 0
+    max_players_seen = 0
+    total_map_area = math.pi * MAP_RADIUS * MAP_RADIUS
+
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -317,13 +327,18 @@ def main(server_ip):
                 game_state = "GAME"
                 active_players = sync_world_data(reply_str)
 
+                # Reset match variables when transitioning into the game
+                current_percentage = 0.0
+                frame_counter = 0
+                max_players_seen = len(active_players)
+
                 for p in active_players:
                     if p['id'] not in puddle_surfaces:
                         px = p['x'] + PLAYER_WIDTH // 2
                         py = p['y'] + PLAYER_HEIGHT // 2
                         puddle_surfaces[p['id']] = create_local_puddle(p['color'], px, py)
 
-        elif game_state == "GAME":
+        elif game_state in ("GAME", "DEAD"):
             my_struct = next((p for p in active_players if p['id'] == my_id), None)
             cam_x, cam_y = 0, 0
 
@@ -340,23 +355,57 @@ def main(server_ip):
             else:
                 dx, dy = 0, 0
 
-            conn.send(f"UPDT~{my_id}~{dx}~{dy}")
-            reply_str = conn.recv()
-            active_players = sync_world_data(reply_str)
+            if game_state == "GAME":
+                conn.send(f"UPDT~{my_id}~{dx}~{dy}")
+                reply_str = conn.recv()
+                active_players = sync_world_data(reply_str)
 
             active_ids = {p['id'] for p in active_players if p['alive']}
             keys_to_remove = [pid for pid in puddle_surfaces if pid not in active_ids]
             for k in keys_to_remove:
                 del puddle_surfaces[k]
 
+            # --- CALCULATE WIN/LOSS CONDITIONS ---
+            frame_counter += 1
+            max_players_seen = max(max_players_seen, len(active_players))
+
+            # Calculate captured area efficiently (every 15 frames to prevent lag)
+            if my_id in puddle_surfaces and frame_counter % 15 == 0:
+                my_mask = pygame.mask.from_surface(puddle_surfaces[my_id])
+                current_percentage = (my_mask.count() / total_map_area) * 100
+
+            alive_others = [p for p in active_players if p['alive'] and p['id'] != my_id]
+
             if game_state == "DEAD":
                 conn.send(f"EXIT~{my_id}")
-                conn.recv()
-                my_id = None
-                puddle_surfaces.clear()
-                active_players = []
-                game_state = "LOBBY"
+                try:
+                    conn.recv()
+                except:
+                    pass  # Ignore if server already closed the socket
+                game_state = "LOST"
+                end_screen_start_time = pygame.time.get_ticks()
                 continue
+            elif max_players_seen > 1 and len(alive_others) == 0:
+                # Won by eliminating everyone else
+                conn.send(f"EXIT~{my_id}")
+                try:
+                    conn.recv()
+                except:
+                    pass
+                game_state = "WON"
+                end_screen_start_time = pygame.time.get_ticks()
+                continue
+            elif current_percentage >= 99.0:
+                # Won by capturing 99% of the map
+                conn.send(f"EXIT~{my_id}")
+                try:
+                    conn.recv()
+                except:
+                    pass
+                game_state = "WON"
+                end_screen_start_time = pygame.time.get_ticks()
+                continue
+            # ------------------------------------
 
             for p in active_players:
                 if p['id'] not in puddle_surfaces and p['alive']:
@@ -413,6 +462,26 @@ def main(server_ip):
                         center=(p['x'] + PLAYER_WIDTH // 2 - cam_x, p['y'] + PLAYER_HEIGHT // 2 - cam_y))
 
                 screen.blit(rot_surf, rect)
+
+            # --- DRAW PERCENTAGE ---
+            perc_text = button_font.render(f"Captured: {current_percentage:.1f}%", True, GOLD)
+            screen.blit(perc_text, (WINDOW_WIDTH - perc_text.get_width() - 20, 20))
+
+        elif game_state in ("LOST", "WON"):
+            screen.fill(BLACK)
+            msg = "YOU WIN!" if game_state == "WON" else "YOU LOSE!"
+            color = GOLD if game_state == "WON" else (255, 50, 50)
+
+            text_surf = font.render(msg, True, color)
+            screen.blit(text_surf, (WINDOW_WIDTH // 2 - text_surf.get_width() // 2,
+                                    WINDOW_HEIGHT // 2 - text_surf.get_height() // 2))
+
+            # Wait exactly 2 seconds (2000 milliseconds) before returning to the lobby
+            if pygame.time.get_ticks() - end_screen_start_time > 2000:
+                my_id = None
+                puddle_surfaces.clear()
+                active_players = []
+                game_state = "LOBBY"
 
         pygame.display.flip()
         clock.tick(60)
