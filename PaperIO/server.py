@@ -4,6 +4,7 @@ import threading
 import math
 import pygame
 import random
+import auth
 from encryption import (
     generate_rsa_keys, rsa_decrypt,
     dh_generate_private, dh_compute_public, dh_compute_shared,
@@ -25,7 +26,7 @@ PLAYER_SPEED = 4
 TRAIL_WIDTH = PLAYER_WIDTH
 PUDDLE_RADIUS = 90
 
-REQUIRED_PLAYERS = 2
+REQUIRED_PLAYERS = 1
 
 # Generate Server RSA Keys once on startup
 print("Generating Server RSA Keys...")
@@ -60,11 +61,10 @@ class GameState:
     def __init__(self):
         self.players = {}
         self.lock = threading.Lock()
-        self.next_id = 1
         self.phase = "WAITING"
         self.required_players = REQUIRED_PLAYERS
 
-    def add_player(self):
+    def add_player(self, requested_id):
         with self.lock:
             if self.phase == "PLAYING":
                 return None
@@ -73,9 +73,11 @@ class GameState:
                 self.players.clear()
                 self.phase = "WAITING"
 
-            p_id = str(self.next_id)
+            if requested_id in self.players:
+                return None
+
+            p_id = requested_id
             self.players[p_id] = PlayerSession(p_id)
-            self.next_id += 1
 
             if len(self.players) >= self.required_players:
                 self._start_game()
@@ -262,8 +264,22 @@ def protocol_build_reply(req_str):
         fields = req_str.split('~')
         code = fields[0]
 
-        if code == 'JOIN':
-            p_id = shared_game.add_player()
+        if code == 'SIGN':
+            if len(fields) < 3: return "SIGNR~ERR~Missing fields"
+            success, msg = auth.signup_user(fields[1], fields[2])
+            if success:
+                return "SIGNR~OK"
+            return f"SIGNR~ERR~{msg}"
+
+        elif code == 'LOGN':
+            if len(fields) < 3: return "LOGNR~ERR~Missing fields"
+            success, msg = auth.login_user(fields[1], fields[2])
+            if success:
+                return f"LOGNR~OK~{fields[1]}"
+            return f"LOGNR~ERR~{msg}"
+
+        elif code == 'JOIN':
+            p_id = shared_game.add_player(fields[1])
             if not p_id:
                 return "ERRR~Match already in progress!"
             p = shared_game.players[p_id]
@@ -363,7 +379,6 @@ def handle_client(sock, tid, addr):
     try:
         conn = TcpBySize(sock)
 
-        # Require secure handshake before processing any game requests
         if not do_key_exchange(conn):
             print(f"Key exchange failed for {addr}")
             sock.close()
@@ -372,7 +387,6 @@ def handle_client(sock, tid, addr):
         print(f"Secure connection established with {addr}")
 
         while True:
-            # TcpBySize handles the decryption automatically
             str_data = conn.recv()
             if not str_data: break
 
@@ -381,7 +395,6 @@ def handle_client(sock, tid, addr):
                 if len(parts) > 1: p_id = parts[1]
 
             to_send = protocol_build_reply(str_data)
-            # TcpBySize handles the encryption automatically
             conn.send(to_send)
 
     except Exception as e:
