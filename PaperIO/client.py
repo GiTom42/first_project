@@ -27,7 +27,7 @@ WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 TRAIL_ALPHA_COLOR = (100, 149, 237)
 PUDDLE_BASE_COLOR = (0, 80, 170)
-GOLD = (255, 215, 0)
+GOLD = (255, 215, 0)  # Used for the percentage text
 
 TRAIL_WIDTH = PLAYER_WIDTH
 PUDDLE_RADIUS = 90
@@ -95,7 +95,6 @@ def apply_local_capture(p_id, points, color, surfaces_dict):
     xs = [pt[0] for pt in points]
     ys = [pt[1] for pt in points]
 
-    # Use union to ensure the bounding box doesn't cut off "valleys" in the base shape
     surf = surfaces_dict[p_id]
     trail_rect = pygame.Rect(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
     base_rect = surf.get_bounding_rect()
@@ -467,6 +466,7 @@ def main(server_ip):
                 game_state = "GAME"
                 active_players = sync_world_data(reply_str)
 
+                # Reset match variables when transitioning into the game
                 current_percentage = 0.0
                 frame_counter = 0
                 max_players_seen = len(active_players)
@@ -507,6 +507,7 @@ def main(server_ip):
             frame_counter += 1
             max_players_seen = max(max_players_seen, len(active_players))
 
+            # Calculate captured area efficiently (every 15 frames to prevent lag)
             if my_id in puddle_surfaces and frame_counter % 15 == 0:
                 my_mask = pygame.mask.from_surface(puddle_surfaces[my_id])
                 current_percentage = (my_mask.count() / total_map_area) * 100
@@ -518,7 +519,7 @@ def main(server_ip):
                 try:
                     conn.recv()
                 except:
-                    pass
+                    pass  # Ignore if server already closed the socket
                 game_state = "LOST"
                 end_screen_start_time = pygame.time.get_ticks()
                 continue
@@ -597,6 +598,7 @@ def main(server_ip):
 
                 screen.blit(rot_surf, rect)
 
+            # --- DRAW PERCENTAGE ---
             perc_text = button_font.render(f"Captured: {current_percentage:.1f}%", True, GOLD)
             screen.blit(perc_text, (WINDOW_WIDTH - perc_text.get_width() - 20, 20))
 
@@ -609,6 +611,7 @@ def main(server_ip):
             screen.blit(text_surf, (WINDOW_WIDTH // 2 - text_surf.get_width() // 2,
                                     WINDOW_HEIGHT // 2 - text_surf.get_height() // 2))
 
+            # Wait exactly 2 seconds (2000 milliseconds) before returning to the lobby
             if pygame.time.get_ticks() - end_screen_start_time > 2000:
                 my_id = None
                 puddle_surfaces.clear()
