@@ -26,12 +26,62 @@ PLAYER_SPEED = 4
 TRAIL_WIDTH = PLAYER_WIDTH
 PUDDLE_RADIUS = 90
 
-REQUIRED_PLAYERS = 1
+REQUIRED_PLAYERS = 2
 
-# Generate Server RSA Keys once on startup
 print("Generating Server RSA Keys...")
 RSA_PRIVATE_PEM, RSA_PUBLIC_PEM = generate_rsa_keys()
 print("Keys Generated.")
+
+
+# ====================== PUDDLE SPLIT LOGIC ======================
+def enforce_puddle_connectivity(p_surf, px, py, trail_pts, last_pos):
+    """
+    Checks if a puddle has been split into pieces. Keeps only the piece
+    that the player is currently touching or rooted to.
+    """
+    mask = pygame.mask.from_surface(p_surf)
+    safe_pt = None
+
+    # 1. Check direct connection points (Player center, Trail Origin, Last Inside Pos)
+    candidates = [(int(px), int(py))]
+    if trail_pts and len(trail_pts) > 0:
+        candidates.append((int(trail_pts[0][0]), int(trail_pts[0][1])))
+    if last_pos:
+        candidates.append((int(last_pos[0]), int(last_pos[1])))
+
+    for cx, cy in candidates:
+        if 0 <= cx < p_surf.get_width() and 0 <= cy < p_surf.get_height():
+            if mask.get_at((cx, cy)):
+                safe_pt = (cx, cy)
+                break
+
+    # 2. Fallback: If exact edge was clipped, search nearby pixels
+    if not safe_pt and last_pos:
+        lx, ly = int(last_pos[0]), int(last_pos[1])
+        found = False
+        for r in range(1, 45):  # Spiral out slightly larger than player width
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    if abs(dx) == r or abs(dy) == r:
+                        nx, ny = lx + dx, ly + dy
+                        if 0 <= nx < p_surf.get_width() and 0 <= ny < p_surf.get_height():
+                            if mask.get_at((nx, ny)):
+                                safe_pt = (nx, ny)
+                                found = True
+                                break
+                if found: break
+            if found: break
+
+    # 3. Rebuild the surface keeping ONLY the connected component
+    if safe_pt:
+        keep_mask = mask.connected_component(safe_pt)
+        if keep_mask.count() == mask.count(): return  # Optimization: not split
+        color = p_surf.get_at(safe_pt)
+        p_surf.fill((0, 0, 0, 0))
+        kept_surf = keep_mask.to_surface(setcolor=color, unsetcolor=(0, 0, 0, 0))
+        p_surf.blit(kept_surf, (0, 0))
+    else:
+        p_surf.fill((0, 0, 0, 0))  # Completely wiped out
 
 
 # ====================== GAME STATE MANAGER ======================
@@ -52,7 +102,6 @@ class PlayerSession:
         self.x = cx - PLAYER_WIDTH / 2.0
         self.y = cy - PLAYER_HEIGHT / 2.0
         self.last_inside_pos = (cx, cy)
-
         self.puddle_surface.fill((0, 0, 0, 0))
         pygame.draw.circle(self.puddle_surface, (255, 255, 255, 255), (cx, cy), PUDDLE_RADIUS)
 
@@ -66,37 +115,25 @@ class GameState:
 
     def add_player(self, requested_id):
         with self.lock:
-            if self.phase == "PLAYING":
-                return None
-
+            if self.phase == "PLAYING": return None
             if self.phase == "GAMEOVER":
                 self.players.clear()
                 self.phase = "WAITING"
-
-            if requested_id in self.players:
-                return None
-
+            if requested_id in self.players: return None
             p_id = requested_id
             self.players[p_id] = PlayerSession(p_id)
-
-            if len(self.players) >= self.required_players:
-                self._start_game()
-
+            if len(self.players) >= self.required_players: self._start_game()
             return p_id
 
     def remove_player(self, p_id):
         with self.lock:
-            if p_id in self.players:
-                del self.players[p_id]
-
-            if len(self.players) == 0:
-                self.phase = "WAITING"
+            if p_id in self.players: del self.players[p_id]
+            if len(self.players) == 0: self.phase = "WAITING"
 
     def _start_game(self):
         self.phase = "PLAYING"
         spawn_radius = MAP_RADIUS * 0.6
         angle_step = (2 * math.pi) / len(self.players)
-
         for i, p_id in enumerate(self.players.keys()):
             angle = i * angle_step
             cx = MAP_CENTER_X + spawn_radius * math.cos(angle)
@@ -110,15 +147,12 @@ class GameState:
 
             p = self.players[p_id]
             distance = math.hypot(dx, dy)
-
             if distance > 0:
                 p.x += (dx / distance) * PLAYER_SPEED
                 p.y += (dy / distance) * PLAYER_SPEED
-
                 cx = p.x + PLAYER_WIDTH / 2
                 cy = p.y + PLAYER_HEIGHT / 2
                 dist_from_center = math.hypot(cx - MAP_CENTER_X, cy - MAP_CENTER_Y)
-
                 if dist_from_center > MAP_RADIUS - PLAYER_WIDTH / 2:
                     angle = math.atan2(cy - MAP_CENTER_Y, cx - MAP_CENTER_X)
                     p.x = MAP_CENTER_X - PLAYER_WIDTH / 2 + math.cos(angle) * (MAP_RADIUS - PLAYER_WIDTH / 2)
@@ -132,8 +166,7 @@ class GameState:
             if is_inside:
                 p.last_inside_pos = p_center
             else:
-                if p.was_inside_puddle:
-                    p.trail_points.append(p.last_inside_pos)
+                if p.was_inside_puddle: p.trail_points.append(p.last_inside_pos)
                 if not p.trail_points or math.hypot(p.trail_points[-1][0] - p_center[0],
                                                     p.trail_points[-1][1] - p_center[1]) > 3:
                     p.trail_points.append(p_center)
@@ -214,7 +247,13 @@ class GameState:
 
                         for enemy_id, enemy in self.players.items():
                             if enemy_id != p_id:
+                                # 1. Erase the stolen chunk
                                 enemy.puddle_surface.blit(erase_surf, (bx1, by1), special_flags=pygame.BLEND_RGBA_SUB)
+                                # 2. Enforce Puddle Split Mechanics
+                                ex = enemy.x + PLAYER_WIDTH / 2
+                                ey = enemy.y + PLAYER_HEIGHT / 2
+                                enforce_puddle_connectivity(enemy.puddle_surface, ex, ey, enemy.trail_points,
+                                                            enemy.last_inside_pos)
 
                         for target_player in self.players.values():
                             target_player.unread_captures.append((p_id, list(p.trail_points)))
@@ -249,9 +288,9 @@ class GameState:
             for i in range(safe_index):
                 dist = point_to_segment_dist(p_center, enemy.trail_points[i], enemy.trail_points[i + 1])
                 if dist < hitbox_radius + (TRAIL_WIDTH / 2):
-                    self.players[current_id].alive = False
-                    self.players[current_id].trail_points = []
-                    self.players[current_id].puddle_surface.fill((0, 0, 0, 0))
+                    self.players[enemy_id].alive = False
+                    self.players[enemy_id].trail_points = []
+                    self.players[enemy_id].puddle_surface.fill((0, 0, 0, 0))
                     return
 
 
@@ -267,21 +306,18 @@ def protocol_build_reply(req_str):
         if code == 'SIGN':
             if len(fields) < 3: return "SIGNR~ERR~Missing fields"
             success, msg = auth.signup_user(fields[1], fields[2])
-            if success:
-                return "SIGNR~OK"
+            if success: return "SIGNR~OK"
             return f"SIGNR~ERR~{msg}"
 
         elif code == 'LOGN':
             if len(fields) < 3: return "LOGNR~ERR~Missing fields"
             success, msg = auth.login_user(fields[1], fields[2])
-            if success:
-                return f"LOGNR~OK~{fields[1]}"
+            if success: return f"LOGNR~OK~{fields[1]}"
             return f"LOGNR~ERR~{msg}"
 
         elif code == 'JOIN':
             p_id = shared_game.add_player(fields[1])
-            if not p_id:
-                return "ERRR~Match already in progress!"
+            if not p_id: return "ERRR~Match already in progress!"
             p = shared_game.players[p_id]
             return f"JOINR~{p_id}~{p.color[0]},{p.color[1]},{p.color[2]}"
 
@@ -329,28 +365,18 @@ def protocol_build_reply(req_str):
 # ====================== ENCRYPTION HANDSHAKE ======================
 def do_key_exchange(conn):
     method_msg = conn.recv()
-    if not method_msg.startswith("METHOD|"):
-        return False
-
+    if not method_msg.startswith("METHOD|"): return False
     method = method_msg.split("|", 1)[1].upper()
-
     if method not in ("RSA", "DH"):
         conn.send("METHOD_FAIL|Unsupported method")
         return False
-
     conn.send("METHOD_OK")
-
     if method == "RSA":
         req = conn.recv()
-        if req != "PUBKEY_REQ":
-            return False
-
+        if req != "PUBKEY_REQ": return False
         conn.send("PUBKEY|" + RSA_PUBLIC_PEM.hex())
-
         key_msg = conn.recv()
-        if not key_msg.startswith("KEY|"):
-            return False
-
+        if not key_msg.startswith("KEY|"): return False
         encrypted_aes = bytes.fromhex(key_msg.split("|", 1)[1])
         aes_key = rsa_decrypt(encrypted_aes, RSA_PRIVATE_PEM)
         conn.send("KEY_OK")
@@ -359,13 +385,9 @@ def do_key_exchange(conn):
     else:
         server_private = dh_generate_private()
         server_public = dh_compute_public(server_private)
-
         conn.send(f"DH_PARAMS|{DH_PRIME:x}|{DH_GENERATOR}|{server_public:x}")
-
         resp = conn.recv()
-        if not resp.startswith("DH_KEY|"):
-            return False
-
+        if not resp.startswith("DH_KEY|"): return False
         client_public = int(resp.split("|", 1)[1], 16)
         shared = dh_compute_shared(client_public, server_private)
         aes_key = dh_derive_aes_key(shared)
@@ -378,25 +400,19 @@ def handle_client(sock, tid, addr):
     p_id = None
     try:
         conn = TcpBySize(sock)
-
         if not do_key_exchange(conn):
             print(f"Key exchange failed for {addr}")
             sock.close()
             return
-
         print(f"Secure connection established with {addr}")
-
         while True:
             str_data = conn.recv()
             if not str_data: break
-
             if str_data.startswith('UPDT') or str_data.startswith('EXIT'):
                 parts = str_data.split('~')
                 if len(parts) > 1: p_id = parts[1]
-
             to_send = protocol_build_reply(str_data)
             conn.send(to_send)
-
     except Exception as e:
         pass
     finally:

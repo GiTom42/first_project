@@ -27,7 +27,7 @@ WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 TRAIL_ALPHA_COLOR = (100, 149, 237)
 PUDDLE_BASE_COLOR = (0, 80, 170)
-GOLD = (255, 215, 0)  # Used for the percentage text
+GOLD = (255, 215, 0)
 
 TRAIL_WIDTH = PLAYER_WIDTH
 PUDDLE_RADIUS = 90
@@ -89,7 +89,50 @@ def create_local_puddle(color, start_x, start_y):
     return surf
 
 
-def apply_local_capture(p_id, points, color, surfaces_dict):
+# ====================== PUDDLE SPLIT LOGIC ======================
+def enforce_puddle_connectivity(p_surf, px, py, trail_pts):
+    mask = pygame.mask.from_surface(p_surf)
+    safe_pt = None
+
+    candidates = [(int(px), int(py))]
+    if trail_pts and len(trail_pts) > 0:
+        candidates.append((int(trail_pts[0][0]), int(trail_pts[0][1])))
+
+    for cx, cy in candidates:
+        if 0 <= cx < p_surf.get_width() and 0 <= cy < p_surf.get_height():
+            if mask.get_at((cx, cy)):
+                safe_pt = (cx, cy)
+                break
+
+    if not safe_pt and trail_pts and len(trail_pts) > 0:
+        lx, ly = int(trail_pts[0][0]), int(trail_pts[0][1])
+        found = False
+        for r in range(1, 45):
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    if abs(dx) == r or abs(dy) == r:
+                        nx, ny = lx + dx, ly + dy
+                        if 0 <= nx < p_surf.get_width() and 0 <= ny < p_surf.get_height():
+                            if mask.get_at((nx, ny)):
+                                safe_pt = (nx, ny)
+                                found = True
+                                break
+                if found: break
+            if found: break
+
+    if safe_pt:
+        keep_mask = mask.connected_component(safe_pt)
+        if keep_mask.count() == mask.count(): return
+        color = p_surf.get_at(safe_pt)
+        p_surf.fill((0, 0, 0, 0))
+        kept_surf = keep_mask.to_surface(setcolor=color, unsetcolor=(0, 0, 0, 0))
+        p_surf.blit(kept_surf, (0, 0))
+    else:
+        p_surf.fill((0, 0, 0, 0))
+
+
+# Notice that apply_local_capture now takes players_list as a parameter
+def apply_local_capture(p_id, points, color, surfaces_dict, players_list):
     if len(points) < 2: return
 
     xs = [pt[0] for pt in points]
@@ -110,7 +153,6 @@ def apply_local_capture(p_id, points, color, surfaces_dict):
     if bw <= 0 or bh <= 0: return
 
     p_color = (max(0, color[0] - 40), max(0, color[1] - 40), max(0, color[2] - 40), 255)
-
     sub_surf = pygame.Surface((bw, bh), pygame.SRCALPHA)
     sub_surf.blit(surf, (0, 0), pygame.Rect(bx1, by1, bw, bh))
 
@@ -167,7 +209,15 @@ def apply_local_capture(p_id, points, color, surfaces_dict):
 
     for other_id, other_surf in surfaces_dict.items():
         if other_id != p_id:
+            # 1. Erase the stolen chunk locally
             other_surf.blit(erase_surf, (bx1, by1), special_flags=pygame.BLEND_RGBA_SUB)
+            # 2. Enforce Puddle Split Mechanics
+            enemy_info = next((p for p in players_list if p['id'] == other_id), None)
+            if enemy_info:
+                ex = enemy_info['x'] + PLAYER_WIDTH // 2
+                ey = enemy_info['y'] + PLAYER_HEIGHT // 2
+                trail = enemy_info['trail']
+                enforce_puddle_connectivity(other_surf, ex, ey, trail)
 
 
 map_background = pygame.Surface((MAP_WIDTH, MAP_HEIGHT))
@@ -227,7 +277,8 @@ def sync_world_data(str_reply):
 
                 if cid in puddle_surfaces:
                     target_color = next((p['color'] for p in players_list if p['id'] == cid), (0, 0, 255))
-                    apply_local_capture(cid, cap_pts, target_color, puddle_surfaces)
+                    # Passed players_list to allow the split logic to see everyone's position
+                    apply_local_capture(cid, cap_pts, target_color, puddle_surfaces, players_list)
 
         return players_list
     except Exception as e:
@@ -235,7 +286,6 @@ def sync_world_data(str_reply):
         return []
 
 
-# ====================== ENCRYPTION HANDSHAKE ======================
 def connect_securely(ip, port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -306,14 +356,12 @@ def main(server_ip):
     running = True
     active_players = []
 
-    # --- MATCH TRACKING VARIABLES ---
     end_screen_start_time = 0
     current_percentage = 0.0
     frame_counter = 0
     max_players_seen = 0
     total_map_area = math.pi * MAP_RADIUS * MAP_RADIUS
 
-    # --- AUTH GUI VARIABLES ---
     username_box = TextInputBox(WINDOW_WIDTH // 2 - 125, WINDOW_HEIGHT // 2 - 50, 250, 40, "Username")
     password_box = TextInputBox(WINDOW_WIDTH // 2 - 125, WINDOW_HEIGHT // 2 + 10, 250, 40, "Password", is_password=True)
     submit_btn_rect = pygame.Rect(WINDOW_WIDTH // 2 - 75, WINDOW_HEIGHT // 2 + 80, 150, 40)
@@ -332,7 +380,6 @@ def main(server_ip):
                 if my_id: conn.send(f"EXIT~{my_id}")
                 running = False
 
-            # --- AUTHENTICATION EVENTS ---
             if game_state == "AUTH_CHOOSE":
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     if login_btn_rect.collidepoint(event.pos):
@@ -371,7 +418,6 @@ def main(server_ip):
                                 else:
                                     auth_msg = reply[2]
 
-            # --- LOBBY EVENTS ---
             elif game_state == "LOBBY" and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if start_button_rect.collidepoint(event.pos):
                     conn.send(f"JOIN~{logged_in_username}")
@@ -385,7 +431,6 @@ def main(server_ip):
                     else:
                         print("Could not join:", reply)
 
-        # --- DRAW AUTHENTICATION CHOOSE STATE ---
         if game_state == "AUTH_CHOOSE":
             screen.fill(BLACK)
             title_text = font.render("Secure Paper.io", True, WHITE)
@@ -406,7 +451,6 @@ def main(server_ip):
                 msg_surf = button_font.render(auth_msg, True, msg_color)
                 screen.blit(msg_surf, (WINDOW_WIDTH // 2 - msg_surf.get_width() // 2, WINDOW_HEIGHT - 100))
 
-        # --- DRAW AUTHENTICATION INPUT STATE ---
         elif game_state == "AUTH_INPUT":
             screen.fill(BLACK)
             title = "LOGIN" if auth_mode == "LOGN" else "SIGNUP"
@@ -430,7 +474,6 @@ def main(server_ip):
                 msg_surf = button_font.render(auth_msg, True, (255, 50, 50))
                 screen.blit(msg_surf, (WINDOW_WIDTH // 2 - msg_surf.get_width() // 2, WINDOW_HEIGHT - 100))
 
-        # --- DRAW LOBBY STATE ---
         elif game_state == "LOBBY":
             screen.fill(BLACK)
 
@@ -466,7 +509,6 @@ def main(server_ip):
                 game_state = "GAME"
                 active_players = sync_world_data(reply_str)
 
-                # Reset match variables when transitioning into the game
                 current_percentage = 0.0
                 frame_counter = 0
                 max_players_seen = len(active_players)
@@ -507,7 +549,6 @@ def main(server_ip):
             frame_counter += 1
             max_players_seen = max(max_players_seen, len(active_players))
 
-            # Calculate captured area efficiently (every 15 frames to prevent lag)
             if my_id in puddle_surfaces and frame_counter % 15 == 0:
                 my_mask = pygame.mask.from_surface(puddle_surfaces[my_id])
                 current_percentage = (my_mask.count() / total_map_area) * 100
@@ -519,7 +560,7 @@ def main(server_ip):
                 try:
                     conn.recv()
                 except:
-                    pass  # Ignore if server already closed the socket
+                    pass
                 game_state = "LOST"
                 end_screen_start_time = pygame.time.get_ticks()
                 continue
@@ -598,7 +639,6 @@ def main(server_ip):
 
                 screen.blit(rot_surf, rect)
 
-            # --- DRAW PERCENTAGE ---
             perc_text = button_font.render(f"Captured: {current_percentage:.1f}%", True, GOLD)
             screen.blit(perc_text, (WINDOW_WIDTH - perc_text.get_width() - 20, 20))
 
@@ -611,7 +651,6 @@ def main(server_ip):
             screen.blit(text_surf, (WINDOW_WIDTH // 2 - text_surf.get_width() // 2,
                                     WINDOW_HEIGHT // 2 - text_surf.get_height() // 2))
 
-            # Wait exactly 2 seconds (2000 milliseconds) before returning to the lobby
             if pygame.time.get_ticks() - end_screen_start_time > 2000:
                 my_id = None
                 puddle_surfaces.clear()
