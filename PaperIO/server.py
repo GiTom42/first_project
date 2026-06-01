@@ -1,3 +1,5 @@
+__author__ = 'Tom Wallerstein'
+
 from tcp_by_size import TcpBySize
 import socket
 import threading

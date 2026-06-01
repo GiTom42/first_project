@@ -1,3 +1,5 @@
+__author__ = 'Tom Wallerstein'
+
 import struct
 from encryption import aes_encrypt, aes_decrypt
 

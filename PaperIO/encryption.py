@@ -1,3 +1,5 @@
+__author__ = 'Tom Wallerstein'
+
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from Crypto.PublicKey import RSA

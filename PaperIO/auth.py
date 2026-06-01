@@ -1,3 +1,5 @@
+__author__ = 'Tom Wallerstein'
+
 import hashlib
 import os
 import pickle

@@ -1,3 +1,5 @@
+__author__ = 'Tom Wallerstein'
+
 from tcp_by_size import TcpBySize
 import socket
 import sys
@@ -131,7 +133,6 @@ def enforce_puddle_connectivity(p_surf, px, py, trail_pts):
         p_surf.fill((0, 0, 0, 0))
 
 
-# Notice that apply_local_capture now takes players_list as a parameter
 def apply_local_capture(p_id, points, color, surfaces_dict, players_list):
     if len(points) < 2: return
 
