@@ -24,7 +24,7 @@ def save_db(db):
 
 
 def hash_password(password: str, salt: bytes) -> str:
-    # Hash combining password, salt, and pepper just like the assignment
+    # Hash combining password, salt, and pepper
     pw_bytes = password.encode('utf-8')
     return hashlib.sha256(pw_bytes + salt + PEPPER).hexdigest()
 
